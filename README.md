@@ -6,7 +6,7 @@ A minimal Netflix-style video streamer on Cloudflare Workers.
   support (seeking works in the `<video>` player).
 - **D1** (`reon-stream-db`) holds the catalogue — each row is a title plus the
   path of the video file in R2.
-- **R2** (`reon-stream-videos`) holds the actual video files (and optional
+- **R2** (`reon-stream`) holds the actual video files (and optional
   thumbnails).
 - **Auth** is a single password stored as the `APP_PASSWORD` Worker secret.
   A successful login sets an HMAC-signed, HttpOnly cookie valid for 7 days.
@@ -17,7 +17,7 @@ A minimal Netflix-style video streamer on Cloudflare Workers.
 1. Upload a video to the bucket:
 
    ```sh
-   npx wrangler r2 object put reon-stream-videos/movies/my-film.mp4 \
+   npx wrangler r2 object put reon-stream/movies/my-film.mp4 \
      --file ./my-film.mp4 --content-type video/mp4 --remote
    ```
 
