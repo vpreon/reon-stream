@@ -269,7 +269,8 @@ export default {
         typeof body?.contentType === 'string' && body.contentType !== ''
           ? body.contentType
           : guessContentType(filename);
-      const key = await freshKey(env, 'uploads', filename);
+      const prefix = body?.kind === 'thumb' ? 'thumbs' : 'uploads';
+      const key = await freshKey(env, prefix, filename);
       const upload = await env.VIDEOS.createMultipartUpload(key, {
         httpMetadata: { contentType },
       });

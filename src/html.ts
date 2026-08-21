@@ -344,6 +344,9 @@ export const APP_HTML = /* html */ `<!doctype html>
 
   // ---- uploading ----
   const PART_SIZE = 40 * 1024 * 1024; // stays well under the Workers request body limit
+  const CONCURRENCY = 4;              // parts in flight at once
+  const PART_RETRIES = 3;
+  const DIRECT_LIMIT = 90 * 1024 * 1024; // single-request cap for thumbnails
 
   const putXhr = (url, body, contentType, onProgress) => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -366,36 +369,66 @@ export const APP_HTML = /* html */ `<!doctype html>
     $('up-status').textContent = text;
   };
 
-  const uploadVideoFile = async (file) => {
+  const fmtMB = (bytes) => (bytes / 1048576).toFixed(1);
+
+  // Chunked multipart upload: CONCURRENCY parts in flight, each retried on failure.
+  const uploadLargeFile = async (file, kind, label) => {
     const { key, uploadId } = await api('/api/upload/create', {
       method: 'POST',
-      body: JSON.stringify({ filename: file.name, contentType: file.type }),
+      body: JSON.stringify({ filename: file.name, contentType: file.type, kind }),
     });
     const totalParts = Math.max(1, Math.ceil(file.size / PART_SIZE));
-    const parts = [];
-    try {
-      for (let i = 0; i < totalParts; i++) {
-        const chunk = file.slice(i * PART_SIZE, Math.min(file.size, (i + 1) * PART_SIZE));
-        const done = i * PART_SIZE;
-        const { etag } = await putXhr(
-          '/api/upload/part?key=' + encodeURIComponent(key) +
-            '&id=' + encodeURIComponent(uploadId) + '&n=' + (i + 1),
-          chunk,
-          'application/octet-stream',
-          (loaded) => setProgress(
-            (done + loaded) / file.size,
-            'Uploading video… ' + Math.round(((done + loaded) / file.size) * 100) + '%'
-              + (totalParts > 1 ? ' (part ' + (i + 1) + '/' + totalParts + ')' : ''),
-          ),
-        );
-        parts.push({ partNumber: i + 1, etag });
+    const parts = new Array(totalParts);
+    const loadedByPart = new Array(totalParts).fill(0);
+    const startedAt = Date.now();
+    let failed = false;
+
+    const report = () => {
+      const sent = loadedByPart.reduce((a, b) => a + b, 0);
+      const secs = (Date.now() - startedAt) / 1000;
+      const speed = secs > 1 ? ' — ' + fmtMB(sent / secs) + ' MB/s' : '';
+      setProgress(sent / file.size,
+        label + '… ' + Math.round((sent / file.size) * 100) + '% (' +
+        fmtMB(sent) + ' / ' + fmtMB(file.size) + ' MB' + speed + ')');
+    };
+
+    const uploadPart = async (i) => {
+      const chunk = file.slice(i * PART_SIZE, Math.min(file.size, (i + 1) * PART_SIZE));
+      const partUrl = '/api/upload/part?key=' + encodeURIComponent(key) +
+        '&id=' + encodeURIComponent(uploadId) + '&n=' + (i + 1);
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const { etag } = await putXhr(partUrl, chunk, 'application/octet-stream',
+            (loaded) => { loadedByPart[i] = loaded; report(); });
+          loadedByPart[i] = chunk.size;
+          parts[i] = { partNumber: i + 1, etag };
+          report();
+          return;
+        } catch (err) {
+          loadedByPart[i] = 0;
+          if (failed || attempt >= PART_RETRIES) throw err;
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
       }
+    };
+
+    try {
+      let next = 0;
+      const workers = Array.from({ length: Math.min(CONCURRENCY, totalParts) }, async () => {
+        while (next < totalParts && !failed) {
+          const i = next++;
+          try { await uploadPart(i); }
+          catch (err) { failed = true; throw err; }
+        }
+      });
+      await Promise.all(workers);
       await api('/api/upload/complete', {
         method: 'POST',
         body: JSON.stringify({ key, uploadId, parts }),
       });
       return key;
     } catch (err) {
+      failed = true;
       api('/api/upload/abort', { method: 'POST', body: JSON.stringify({ key, uploadId }) })
         .catch(() => {});
       throw err;
@@ -414,18 +447,22 @@ export const APP_HTML = /* html */ `<!doctype html>
     $('add-submit').disabled = true;
     try {
       let r2Key = $('v-key').value.trim();
-      if (videoFile) r2Key = await uploadVideoFile(videoFile);
+      if (videoFile) r2Key = await uploadLargeFile(videoFile, 'video', 'Uploading video');
 
       let thumbKey = $('v-thumb').value.trim();
       if (thumbFile) {
-        setProgress(1, 'Uploading thumbnail…');
-        const res = await putXhr(
-          '/api/upload/image?filename=' + encodeURIComponent(thumbFile.name),
-          thumbFile,
-          thumbFile.type || 'image/jpeg',
-          null,
-        );
-        thumbKey = res.key;
+        if (thumbFile.size > DIRECT_LIMIT) {
+          thumbKey = await uploadLargeFile(thumbFile, 'thumb', 'Uploading thumbnail');
+        } else {
+          setProgress(1, 'Uploading thumbnail…');
+          const res = await putXhr(
+            '/api/upload/image?filename=' + encodeURIComponent(thumbFile.name),
+            thumbFile,
+            thumbFile.type || 'image/jpeg',
+            null,
+          );
+          thumbKey = res.key;
+        }
       }
 
       setProgress(1, 'Saving…');
