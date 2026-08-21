@@ -176,6 +176,27 @@ function badKey(key: unknown): boolean {
   return typeof key !== 'string' || key.length === 0 || key.includes('..') || key.startsWith('/');
 }
 
+/** "My Film (2024).MP4" -> "my-film-2024.mp4" */
+function slugifyFilename(name: string): string {
+  const dot = name.lastIndexOf('.');
+  const base =
+    (dot > 0 ? name.slice(0, dot) : name)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80) || 'file';
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+  return ext ? `${base}.${ext}` : base;
+}
+
+/** Pick a collision-free key under the given prefix. */
+async function freshKey(env: Env, prefix: string, filename: string): Promise<string> {
+  const slug = slugifyFilename(filename);
+  const key = `${prefix}/${slug}`;
+  if (!(await env.VIDEOS.head(key))) return key;
+  return `${prefix}/${Date.now()}-${slug}`;
+}
+
 async function readJson(request: Request): Promise<Record<string, unknown> | null> {
   try {
     const body = await request.json();
@@ -236,6 +257,90 @@ export default {
     // ---- everything below requires a valid session ----
     if (!(await isAuthed(request, env))) {
       return json({ error: 'Unauthorized' }, 401);
+    }
+
+    // ---- uploads (chunked multipart into R2; parts stay under the request size limit) ----
+
+    if (pathname === '/api/upload/create' && method === 'POST') {
+      const body = await readJson(request);
+      const filename = typeof body?.filename === 'string' ? body.filename : '';
+      if (!filename) return json({ error: 'filename is required' }, 400);
+      const contentType =
+        typeof body?.contentType === 'string' && body.contentType !== ''
+          ? body.contentType
+          : guessContentType(filename);
+      const key = await freshKey(env, 'uploads', filename);
+      const upload = await env.VIDEOS.createMultipartUpload(key, {
+        httpMetadata: { contentType },
+      });
+      return json({ key: upload.key, uploadId: upload.uploadId });
+    }
+
+    if (pathname === '/api/upload/part' && method === 'PUT') {
+      const key = url.searchParams.get('key') ?? '';
+      const uploadId = url.searchParams.get('id') ?? '';
+      const partNumber = Number(url.searchParams.get('n'));
+      if (badKey(key) || !uploadId || !Number.isInteger(partNumber) || partNumber < 1) {
+        return json({ error: 'Bad part request' }, 400);
+      }
+      if (!request.body) return json({ error: 'Empty body' }, 400);
+      try {
+        const upload = env.VIDEOS.resumeMultipartUpload(key, uploadId);
+        const part = await upload.uploadPart(partNumber, request.body);
+        return json({ etag: part.etag });
+      } catch (e) {
+        return json({ error: e instanceof Error ? e.message : 'Part upload failed' }, 400);
+      }
+    }
+
+    if (pathname === '/api/upload/complete' && method === 'POST') {
+      const body = await readJson(request);
+      const key = typeof body?.key === 'string' ? body.key : '';
+      const uploadId = typeof body?.uploadId === 'string' ? body.uploadId : '';
+      const parts = Array.isArray(body?.parts)
+        ? (body.parts as Array<{ partNumber?: unknown; etag?: unknown }>).flatMap((p) =>
+            typeof p?.partNumber === 'number' && typeof p?.etag === 'string'
+              ? [{ partNumber: p.partNumber, etag: p.etag }]
+              : [],
+          )
+        : [];
+      if (badKey(key) || !uploadId || parts.length === 0) {
+        return json({ error: 'Bad complete request' }, 400);
+      }
+      try {
+        const upload = env.VIDEOS.resumeMultipartUpload(key, uploadId);
+        const object = await upload.complete(parts);
+        return json({ key: object.key, size: object.size });
+      } catch (e) {
+        return json({ error: e instanceof Error ? e.message : 'Complete failed' }, 400);
+      }
+    }
+
+    if (pathname === '/api/upload/abort' && method === 'POST') {
+      const body = await readJson(request);
+      const key = typeof body?.key === 'string' ? body.key : '';
+      const uploadId = typeof body?.uploadId === 'string' ? body.uploadId : '';
+      if (badKey(key) || !uploadId) return json({ error: 'Bad abort request' }, 400);
+      try {
+        await env.VIDEOS.resumeMultipartUpload(key, uploadId).abort();
+      } catch {
+        // already gone — nothing to clean up
+      }
+      return json({ ok: true });
+    }
+
+    // Small direct upload for thumbnail images.
+    if (pathname === '/api/upload/image' && method === 'PUT') {
+      const filename = url.searchParams.get('filename') ?? '';
+      if (!filename) return json({ error: 'filename query param is required' }, 400);
+      const contentType = request.headers.get('content-type') || guessContentType(filename);
+      if (!contentType.startsWith('image/')) {
+        return json({ error: 'Thumbnail must be an image' }, 400);
+      }
+      if (!request.body) return json({ error: 'Empty body' }, 400);
+      const key = await freshKey(env, 'thumbs', filename);
+      await env.VIDEOS.put(key, request.body, { httpMetadata: { contentType } });
+      return json({ key });
     }
 
     if (pathname === '/api/videos' && method === 'GET') {

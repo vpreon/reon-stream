@@ -96,6 +96,16 @@ export const APP_HTML = /* html */ `<!doctype html>
   .panel h2 { font-size: 22px; }
   .panel label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 4px; }
   .error { color: #ff6b6b; font-size: 14px; min-height: 20px; }
+  input[type=file] { padding: 8px; background: var(--surface-2); }
+  input[type=file]::file-selector-button {
+    font: inherit; border: 0; border-radius: 6px; padding: 6px 12px; margin-right: 10px;
+    background: #444; color: var(--text); cursor: pointer;
+  }
+  .or-row { font-size: 12px; color: var(--text-dim); margin: 6px 0 4px; }
+  #up-progress { display: flex; flex-direction: column; gap: 6px; }
+  #up-bar-outer { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+  #up-bar { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  #up-status { font-size: 13px; color: var(--text-dim); }
 
   /* ---- player ---- */
   #player-overlay { flex-direction: column; padding: 3vh 3vw; }
@@ -151,18 +161,26 @@ export const APP_HTML = /* html */ `<!doctype html>
       <textarea id="v-desc" rows="2" maxlength="1000"></textarea>
     </div>
     <div>
-      <label for="v-key">Video path in R2 bucket</label>
-      <input id="v-key" required list="r2-keys" placeholder="movies/inception.mp4">
+      <label for="v-file">Video file</label>
+      <input id="v-file" type="file" accept="video/*,.mkv">
+      <div class="or-row">…or use a path already in the R2 bucket:</div>
+      <input id="v-key" list="r2-keys" placeholder="movies/inception.mp4">
       <datalist id="r2-keys"></datalist>
     </div>
     <div>
-      <label for="v-thumb">Thumbnail path in R2 (optional)</label>
+      <label for="v-thumb-file">Thumbnail image (optional)</label>
+      <input id="v-thumb-file" type="file" accept="image/*">
+      <div class="or-row">…or an existing R2 path:</div>
       <input id="v-thumb" list="r2-keys" placeholder="thumbs/inception.jpg">
+    </div>
+    <div id="up-progress" hidden>
+      <div id="up-bar-outer"><div id="up-bar"></div></div>
+      <div id="up-status"></div>
     </div>
     <div class="error" id="add-error"></div>
     <div style="display:flex; gap:10px; justify-content:flex-end">
       <button class="btn btn-ghost" type="button" id="add-cancel">Cancel</button>
-      <button class="btn btn-accent" type="submit">Add to catalogue</button>
+      <button class="btn btn-accent" type="submit" id="add-submit">Add to catalogue</button>
     </div>
   </form>
 </div>
@@ -324,17 +342,100 @@ export const APP_HTML = /* html */ `<!doctype html>
   });
   $('add-cancel').addEventListener('click', () => $('add-overlay').classList.remove('open'));
 
+  // ---- uploading ----
+  const PART_SIZE = 40 * 1024 * 1024; // stays well under the Workers request body limit
+
+  const putXhr = (url, body, contentType, onProgress) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    if (contentType) xhr.setRequestHeader('content-type', contentType);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded); };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || ('HTTP ' + xhr.status)));
+    };
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+    xhr.send(body);
+  });
+
+  const setProgress = (fraction, text) => {
+    $('up-progress').hidden = false;
+    $('up-bar').style.width = Math.round(fraction * 100) + '%';
+    $('up-status').textContent = text;
+  };
+
+  const uploadVideoFile = async (file) => {
+    const { key, uploadId } = await api('/api/upload/create', {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, contentType: file.type }),
+    });
+    const totalParts = Math.max(1, Math.ceil(file.size / PART_SIZE));
+    const parts = [];
+    try {
+      for (let i = 0; i < totalParts; i++) {
+        const chunk = file.slice(i * PART_SIZE, Math.min(file.size, (i + 1) * PART_SIZE));
+        const done = i * PART_SIZE;
+        const { etag } = await putXhr(
+          '/api/upload/part?key=' + encodeURIComponent(key) +
+            '&id=' + encodeURIComponent(uploadId) + '&n=' + (i + 1),
+          chunk,
+          'application/octet-stream',
+          (loaded) => setProgress(
+            (done + loaded) / file.size,
+            'Uploading video… ' + Math.round(((done + loaded) / file.size) * 100) + '%'
+              + (totalParts > 1 ? ' (part ' + (i + 1) + '/' + totalParts + ')' : ''),
+          ),
+        );
+        parts.push({ partNumber: i + 1, etag });
+      }
+      await api('/api/upload/complete', {
+        method: 'POST',
+        body: JSON.stringify({ key, uploadId, parts }),
+      });
+      return key;
+    } catch (err) {
+      api('/api/upload/abort', { method: 'POST', body: JSON.stringify({ key, uploadId }) })
+        .catch(() => {});
+      throw err;
+    }
+  };
+
   $('add-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     $('add-error').textContent = '';
+    const videoFile = $('v-file').files[0];
+    const thumbFile = $('v-thumb-file').files[0];
+    if (!videoFile && !$('v-key').value.trim()) {
+      $('add-error').textContent = 'Choose a video file or enter an R2 path';
+      return;
+    }
+    $('add-submit').disabled = true;
     try {
+      let r2Key = $('v-key').value.trim();
+      if (videoFile) r2Key = await uploadVideoFile(videoFile);
+
+      let thumbKey = $('v-thumb').value.trim();
+      if (thumbFile) {
+        setProgress(1, 'Uploading thumbnail…');
+        const res = await putXhr(
+          '/api/upload/image?filename=' + encodeURIComponent(thumbFile.name),
+          thumbFile,
+          thumbFile.type || 'image/jpeg',
+          null,
+        );
+        thumbKey = res.key;
+      }
+
+      setProgress(1, 'Saving…');
       const { video } = await api('/api/videos', {
         method: 'POST',
         body: JSON.stringify({
           title: $('v-title').value,
           description: $('v-desc').value,
-          r2_key: $('v-key').value,
-          thumbnail_key: $('v-thumb').value,
+          r2_key: r2Key,
+          thumbnail_key: thumbKey,
         }),
       });
       videos.unshift(video);
@@ -343,6 +444,10 @@ export const APP_HTML = /* html */ `<!doctype html>
       render();
     } catch (err) {
       $('add-error').textContent = err.message;
+    } finally {
+      $('add-submit').disabled = false;
+      $('up-progress').hidden = true;
+      $('up-bar').style.width = '0%';
     }
   });
 
