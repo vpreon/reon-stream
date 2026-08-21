@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "reon-stream",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "observability": { "enabled": true },
+
+  // Video catalogue lives in D1; the actual video files live in R2.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "reon-stream-db",
+      "database_id": "aa3d4ffe-593c-4b7b-9607-6950c683e654"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "VIDEOS",
+      "bucket_name": "reon-stream"
+    }
+  ]
+
+  // Secret (set via CLI, never in this file):
+  //   npx wrangler secret put APP_PASSWORD
+  // For local dev, put APP_PASSWORD=... in .dev.vars
+}
