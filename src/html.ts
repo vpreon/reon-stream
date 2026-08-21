@@ -3,7 +3,7 @@ export const APP_HTML = /* html */ `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reon Stream</title>
+<title>Kaye Cinema</title>
 <style>
   :root {
     --bg: #141414;
@@ -121,7 +121,7 @@ export const APP_HTML = /* html */ `<!doctype html>
 <body>
 
 <header id="app-header" hidden>
-  <div class="brand">REON</div>
+  <div class="brand">Kaye Cinema</div>
   <div class="spacer"></div>
   <input id="search" type="search" placeholder="Search titles…">
   <button class="btn btn-accent" id="add-btn">+ Add video</button>
@@ -137,7 +137,7 @@ export const APP_HTML = /* html */ `<!doctype html>
 <!-- login -->
 <div class="overlay open" id="login-overlay">
   <form class="panel" id="login-form">
-    <div class="brand" style="font-size:32px">REON</div>
+    <div class="brand" style="font-size:32px">Kaye Cinema</div>
     <h2>Sign in</h2>
     <div>
       <label for="password">Password</label>
