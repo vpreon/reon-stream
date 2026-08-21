@@ -198,6 +198,7 @@ export const APP_HTML = /* html */ `<!doctype html>
 (() => {
   const $ = (id) => document.getElementById(id);
   let videos = [];
+  let role = 'viewer';
 
   const api = async (path, opts = {}) => {
     const res = await fetch(path, {
@@ -260,18 +261,20 @@ export const APP_HTML = /* html */ `<!doctype html>
       meta.append(title, desc);
       card.appendChild(meta);
 
-      const del = document.createElement('button');
-      del.className = 'delete';
-      del.textContent = '✕';
-      del.title = 'Remove from catalogue';
-      del.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (!confirm('Remove "' + v.title + '" from the catalogue? (The file stays in R2.)')) return;
-        await api('/api/videos/' + v.id, { method: 'DELETE' });
-        videos = videos.filter(x => x.id !== v.id);
-        render();
-      });
-      card.appendChild(del);
+      if (role === 'admin') {
+        const del = document.createElement('button');
+        del.className = 'delete';
+        del.textContent = '✕';
+        del.title = 'Remove from catalogue';
+        del.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          if (!confirm('Remove "' + v.title + '" from the catalogue? (The file stays in R2.)')) return;
+          await api('/api/videos/' + v.id, { method: 'DELETE' });
+          videos = videos.filter(x => x.id !== v.id);
+          render();
+        });
+        card.appendChild(del);
+      }
 
       card.addEventListener('click', () => play(v));
       grid.appendChild(card);
@@ -281,6 +284,8 @@ export const APP_HTML = /* html */ `<!doctype html>
   const load = async () => {
     const data = await api('/api/videos');
     videos = data.videos;
+    role = data.role || 'viewer';
+    $('add-btn').hidden = role !== 'admin';
     showApp();
     render();
   };

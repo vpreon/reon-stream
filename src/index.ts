@@ -3,9 +3,13 @@ import { APP_HTML } from './html';
 export interface Env {
   DB: D1Database;
   VIDEOS: R2Bucket;
-  /** Set with `wrangler secret put APP_PASSWORD` (or .dev.vars locally). */
-  APP_PASSWORD: string;
+  /** Full access: upload, add, delete, plus watching. */
+  ADMIN_PASSWORD: string;
+  /** Watch-only access: browse the catalogue and stream. */
+  STREAM_PASSWORD: string;
 }
+
+type Role = 'admin' | 'viewer';
 
 const COOKIE_NAME = 'reon_auth';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
@@ -34,26 +38,35 @@ async function hmacKey(secret: string, usage: 'sign' | 'verify'): Promise<Crypto
   );
 }
 
-async function createSessionToken(secret: string): Promise<string> {
+async function createSessionToken(secret: string, role: Role): Promise<string> {
   const exp = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
   const key = await hmacKey(secret, 'sign');
-  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(String(exp)));
-  return `${exp}.${base64url(sig)}`;
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(`${exp}.${role}`));
+  return `${exp}.${role}.${base64url(sig)}`;
 }
 
-async function verifySessionToken(secret: string, token: string): Promise<boolean> {
-  const dot = token.indexOf('.');
-  if (dot < 0) return false;
-  const exp = token.slice(0, dot);
-  const sig = token.slice(dot + 1);
-  if (!/^\d+$/.test(exp) || Number(exp) < Date.now() / 1000) return false;
+/** Returns the session's role, or null if there is no valid session. */
+async function sessionRole(request: Request, env: Env): Promise<Role | null> {
+  const token = getCookie(request, COOKIE_NAME);
+  if (!token) return null;
+  const [exp, role, sig] = token.split('.');
+  if (!exp || !sig || (role !== 'admin' && role !== 'viewer')) return null;
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now() / 1000) return null;
+  const secret = role === 'admin' ? env.ADMIN_PASSWORD : env.STREAM_PASSWORD;
+  if (!secret) return null;
 
-  const sigBytes = Uint8Array.from(
-    atob(sig.replace(/-/g, '+').replace(/_/g, '/')),
-    (c) => c.charCodeAt(0),
-  );
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(
+      atob(sig.replace(/-/g, '+').replace(/_/g, '/')),
+      (c) => c.charCodeAt(0),
+    );
+  } catch {
+    return null;
+  }
   const key = await hmacKey(secret, 'verify');
-  return crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(exp));
+  const ok = await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(`${exp}.${role}`));
+  return ok ? (role as Role) : null;
 }
 
 async function passwordsMatch(supplied: string, actual: string): Promise<boolean> {
@@ -77,12 +90,6 @@ function getCookie(request: Request, name: string): string | null {
     if (k === name) return rest.join('=');
   }
   return null;
-}
-
-async function isAuthed(request: Request, env: Env): Promise<boolean> {
-  const token = getCookie(request, COOKIE_NAME);
-  if (!token) return false;
-  return verifySessionToken(env.APP_PASSWORD, token);
 }
 
 function sessionCookie(token: string, maxAge: number): string {
@@ -226,16 +233,23 @@ export default {
     if (pathname === '/api/login' && method === 'POST') {
       const body = await readJson(request);
       const password = typeof body?.password === 'string' ? body.password : '';
-      if (!env.APP_PASSWORD) {
-        return json({ error: 'APP_PASSWORD secret is not configured' }, 500);
+      if (!env.ADMIN_PASSWORD && !env.STREAM_PASSWORD) {
+        return json({ error: 'No passwords are configured' }, 500);
       }
-      if (!(await passwordsMatch(password, env.APP_PASSWORD))) {
+      let role: Role | null = null;
+      if (env.ADMIN_PASSWORD && (await passwordsMatch(password, env.ADMIN_PASSWORD))) {
+        role = 'admin';
+      } else if (env.STREAM_PASSWORD && (await passwordsMatch(password, env.STREAM_PASSWORD))) {
+        role = 'viewer';
+      }
+      if (!role) {
         // Small fixed delay to blunt brute-force attempts.
         await new Promise((r) => setTimeout(r, 400));
         return json({ error: 'Wrong password' }, 401);
       }
-      const token = await createSessionToken(env.APP_PASSWORD);
-      return new Response(JSON.stringify({ ok: true }), {
+      const secret = role === 'admin' ? env.ADMIN_PASSWORD : env.STREAM_PASSWORD;
+      const token = await createSessionToken(secret, role);
+      return new Response(JSON.stringify({ ok: true, role }), {
         status: 200,
         headers: {
           'content-type': 'application/json',
@@ -255,8 +269,18 @@ export default {
     }
 
     // ---- everything below requires a valid session ----
-    if (!(await isAuthed(request, env))) {
+    const role = await sessionRole(request, env);
+    if (!role) {
       return json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Mutations and uploads need the admin password; viewers can only watch.
+    const adminOnly =
+      pathname.startsWith('/api/upload/') ||
+      pathname === '/api/keys' ||
+      (pathname.startsWith('/api/videos') && method !== 'GET');
+    if (adminOnly && role !== 'admin') {
+      return json({ error: 'Admin password required' }, 403);
     }
 
     // ---- uploads (chunked multipart into R2; parts stay under the request size limit) ----
@@ -348,7 +372,7 @@ export default {
       const { results } = await env.DB.prepare(
         'SELECT id, title, description, r2_key, thumbnail_key, created_at FROM videos ORDER BY created_at DESC, id DESC',
       ).all();
-      return json({ videos: results });
+      return json({ videos: results, role });
     }
 
     if (pathname === '/api/videos' && method === 'POST') {
