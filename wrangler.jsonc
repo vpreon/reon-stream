@@ -5,6 +5,10 @@
   "compatibility_date": "2026-08-01",
   "observability": { "enabled": true },
 
+  // Hardcoded for now — switch back to a secret later with:
+  //   npx wrangler secret put APP_PASSWORD  (and remove this var)
+  "vars": { "APP_PASSWORD": "Vp485123" },
+
   // Video catalogue lives in D1; the actual video files live in R2.
   "d1_databases": [
     {
